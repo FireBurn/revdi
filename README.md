@@ -53,7 +53,7 @@ Builds with the system Rust toolchain (1.77+), no kernel tree required:
 
 ```sh
 make -C library
-sudo make -C library install       # installs libevdi.so.{1.14.16,1} + libevdi.so
+sudo make -C library install       # installs libevdi.so.{1.15.0,1} + libevdi.so
 ```
 
 ### Everything

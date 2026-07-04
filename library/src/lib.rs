@@ -29,8 +29,8 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 const LIBEVDI_VERSION_MAJOR: c_int = 1;
-const LIBEVDI_VERSION_MINOR: c_int = 14;
-const LIBEVDI_VERSION_PATCH: c_int = 16;
+const LIBEVDI_VERSION_MINOR: c_int = 15;
+const LIBEVDI_VERSION_PATCH: c_int = 0;
 
 const EVDI_MODULE_COMPATIBILITY_VERSION_MAJOR: c_int = 1;
 const EVDI_MODULE_COMPATIBILITY_VERSION_MINOR: c_int = 9;

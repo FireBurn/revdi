@@ -109,11 +109,12 @@ const FALLBACK_W: u32 = 1024;
 const FALLBACK_H: u32 = 768;
 
 // libevdi (`is_evdi_compatible`) requires `major == 1 && minor >= 9`; match the C evdi's version so
-// DisplayLinkManager accepts the card. Bumped past the 1.0.0 that made libevdi reject every device.
+// DisplayLinkManager accepts the card. DLM 6.8.1.0 checks the reported version against upstream evdi
+// 1.15.0 (commit 2713cd41) and rejects anything older, so keep this in lockstep with libevdi.
 const INFO: drm::DriverInfo = drm::DriverInfo {
     major: 1,
-    minor: 14,
-    patchlevel: 16,
+    minor: 15,
+    patchlevel: 0,
     name: c"evdi",
     desc: c"Extensible Virtual Display Interface",
 };

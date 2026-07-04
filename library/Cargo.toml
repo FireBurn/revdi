@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 [package]
 name = "revdi"
-version = "1.14.16"
+version = "1.15.0"
 edition = "2021"
 rust-version = "1.77"
 license = "LGPL-2.1-or-later"

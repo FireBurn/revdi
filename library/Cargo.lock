@@ -4,4 +4,4 @@ version = 3
 
 [[package]]
 name = "revdi"
-version = "1.14.16"
+version = "1.15.0"

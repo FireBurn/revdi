@@ -10,7 +10,7 @@ LN ?= ln -sf
 RM ?= rm -f
 CARGO ?= cargo
 
-LIBVER := 1.14.16
+LIBVER := 1.15.0
 LIBABI := 1
 
 PREFIX ?= /usr
