@@ -11,20 +11,55 @@ The module is written against the in-progress
 mode-object layer) and drives a virtual DRM display that DLM pulls pixels from,
 exactly like the C `evdi` does through its own private ioctl ABI.
 
+Replacing `libevdi` and `evdi.ko` leaves one closed component in the stack: the
+`DisplayLinkManager` binary itself, which does the dock's HDCP/control-plane
+handshake and encodes the video. `chimera/` is the beginning of a replacement for
+*that* — a userspace rig that already cold-starts a real dock over libusb using
+the vino driver's control-plane code. Between the three, the whole DisplayLink
+stack becomes open.
+
 > **Naming.** The kernel module identifies itself to userspace as `evdi` (DRM
 > driver name, `/dev/dri/cardN`, the `/sys/devices/evdi` control node) because
 > DLM and `libevdi` hard-code that name. Only the *project* is called revdi.
 
 ## Layout
 
-| Path       | What it is | License |
-|------------|------------|---------|
-| `module/`  | The Rust EVDI kernel module (`evdi.ko`). Virtual DRM/KMS display, EVDI private ioctls, USB-dock pairing, DDC/CI bridge, damage-tracked GRABPIX. | GPL-2.0 |
-| `library/` | `librevdi`: a Rust `cdylib` exposing the exact `evdi_lib.h` C ABI, installed as `libevdi.so.1`. | LGPL-2.1-or-later |
-| `LICENSES/`| Full license texts. | — |
+| Path          | What it is | License |
+|---------------|------------|---------|
+| `module/`     | The Rust EVDI kernel module (`evdi.ko`). Virtual DRM/KMS display, EVDI private ioctls, USB-dock pairing, DDC/CI bridge, damage-tracked GRABPIX. | GPL-2.0 |
+| `library/`    | `librevdi`: a Rust `cdylib` exposing the exact `evdi_lib.h` C ABI, installed as `libevdi.so.1`. | LGPL-2.1-or-later |
+| `chimera/`    | The DLM-replacement rig: compiles the vino driver's kernel control-plane sources verbatim in userspace and drives a dock over libusb. See `chimera/README.md`. | GPL-2.0-or-later |
+| `vino-driver/`| libusb transport for the dock (the `Dock` type chimera drives). | GPL-2.0-or-later |
+| `vino-hdcp/`  | HDCP 2.2 helpers (certificate parsing, KDF) used by the bring-up tooling. | GPL-2.0-or-later |
+| `kernel-shim/`| A userspace stand-in for the kernel prelude, so the vendored kernel sources compile unmodified. | GPL-2.0-or-later |
+| `LICENSES/`   | Full license texts. | — |
 
-The split mirrors upstream evdi: the module is GPL-2.0 (`MODULE_LICENSE("GPL")`),
-the library is LGPL-2.1-or-later so a proprietary client may link it.
+The module/library split mirrors upstream evdi: the module is GPL-2.0
+(`MODULE_LICENSE("GPL")`), the library is LGPL-2.1-or-later so a proprietary
+client may link it.
+
+## Vendored kernel sources
+
+This project is **standalone**: it builds and its tests pass with no kernel tree
+checked out anywhere. It manages that by keeping its own copies of two sets of
+files that are *edited in the kernel tree*:
+
+| Vendored copy      | Upstream source              |
+|--------------------|------------------------------|
+| `module/*.rs`      | `drivers/gpu/drm/evdi/*.rs`  |
+| `chimera/vino/*.rs`| `drivers/gpu/drm/vino/*.rs`  |
+
+The kernel tree is authoritative. Refresh the copies with:
+
+```sh
+make sync KSRC=/path/to/drm-next       # defaults to ../drm
+make check-sync                        # report drift, change nothing, exit 1 if any
+```
+
+Do not hand-edit a vendored file. `chimera`'s proofs are only worth anything
+because it compiles the *literal* driver sources — a local edit here would make
+them silently stop tracking the real driver, which is exactly the drift the rig
+exists to rule out. Edit the kernel tree, then re-run `make sync`.
 
 ## Building
 
@@ -54,6 +89,16 @@ Builds with the system Rust toolchain (1.77+), no kernel tree required:
 ```sh
 make -C library
 sudo make -C library install       # installs libevdi.so.{1.15.0,1} + libevdi.so
+```
+
+### Chimera
+
+Builds with the system Rust toolchain, no kernel tree required (it uses the
+vendored sources above). Needs libusb development headers for the `live` feature:
+
+```sh
+make chimera        # release build of chimera-coldstart (--features live)
+make test           # the offline byte-exact proof vs captured DLM sessions
 ```
 
 ### Everything
@@ -99,9 +144,14 @@ The same drain-then-drop path runs automatically when a dock is unplugged
 
 ## Status
 
-Working end-to-end on a Dell D6000 under KWin/Wayland: multi-head output, live
-frame updates with delta damage, hardware cursor, DDC/CI, and clean teardown on
-dock unplug. See `docs/` for the design notes and the kernel-tree patch set.
+**Module + library:** working end-to-end on a Dell D6000 under KWin/Wayland:
+multi-head output, live frame updates with delta damage, hardware cursor, DDC/CI,
+and clean teardown on dock unplug. See `docs/` for the design notes and the
+kernel-tree patch set.
+
+**Chimera:** not a DLM replacement yet. The control-plane half is real — it
+cold-starts a dock over libusb and the dock engages — but nothing here paints a
+desktop unattended. See `chimera/README.md` for exactly what is and is not proven.
 
 ## License
 
