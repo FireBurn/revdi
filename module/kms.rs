@@ -46,19 +46,27 @@ use kernel::error::code::{EINVAL, ENODEV, ERESTARTSYS, ETIMEDOUT};
 
 /// Module-wide combined-bandwidth registry: each created device (one per dock head, possibly on
 /// physically separate `drm_device`s -- confirmed via `/dev/dri/card22`+`card23` both existing
-/// simultaneously for a single dual-head dock) claims a fixed slot here and stores its last
-/// committed pixel rate (`hdisplay * vdisplay * vrefresh`). `EvdiCrtc::atomic_check` sums every
-/// OTHER device's stored rate plus its own proposed new rate and rejects the commit if together
-/// they exceed the dock's real combined budget.
+/// simultaneously for a single dual-head dock) claims a fixed slot here and records whether it
+/// currently has a monitor attached (`SLOT_CONNECTED`, updated from `EvdiConnector::detect`).
+/// The dock's shared pixel-rate budget is split evenly across however many heads are actually
+/// connected right now (`own_pixel_budget`) -- a lone connected head gets the whole budget.
+///
+/// This replaces an earlier "whatever's left after my siblings' actual committed rate" scheme:
+/// that dynamic model made cold-boot negotiation order-dependent (whichever head's config got
+/// applied first could claim most of the budget, leaving the other to cycle through several
+/// rejected modes before settling — observed stalling kwin's startup with the dock already
+/// attached). A fixed, deterministic split settles in one shot instead. The tradeoff is
+/// accepted deliberately: two connected heads always split 50/50 even if one is running well
+/// under its share, rather than letting the other opportunistically borrow the slack.
 ///
 /// This is a plain module `static`, not routed through `EvdiRegistry` (`evdi.rs`), because that
 /// registry is owned solely by the top-level module struct and has no path to a per-device
 /// `drm_device`/`EvdiDrmData` today -- plumbing it through would mean giving platform devices
-/// shared ownership of it (Arc + platform_data) purely to answer "how many pixels/sec are my
-/// siblings using", which a small fixed-size array already answers with no new lifetime concerns.
+/// shared ownership of it (Arc + platform_data) purely to answer "how many heads are connected",
+/// which a small fixed-size array already answers with no new lifetime concerns.
 const MAX_CARDS: usize = 16; // matches evdi.rs's EvdiRegistry::MAX_CARDS (EVDI_DEVICE_COUNT_MAX)
 static SLOT_IN_USE: [AtomicBool; MAX_CARDS] = [const { AtomicBool::new(false) }; MAX_CARDS];
-static SLOT_PIXEL_RATE: [AtomicU32; MAX_CARDS] = [const { AtomicU32::new(0) }; MAX_CARDS];
+static SLOT_CONNECTED: [AtomicBool; MAX_CARDS] = [const { AtomicBool::new(false) }; MAX_CARDS];
 
 /// Claim a free slot in the combined-bandwidth registry for a newly-probed device. Falls back to
 /// sharing slot 0 if every slot is taken, which should be unreachable in practice: `evdi.rs`'s own
@@ -75,18 +83,24 @@ fn claim_pixel_rate_slot() -> usize {
     0
 }
 
-/// Sum of every OTHER device's currently-committed pixel rate, excluding `own_slot`. Shared by
-/// `EvdiCrtc::atomic_check` (hard commit-time enforcement) and `EvdiConnector::mode_valid` (so a
-/// head's advertised mode list already reflects how much budget its siblings are using, instead
-/// of only ever finding out via a rejected commit).
-fn other_heads_rate(own_slot: usize) -> u32 {
-    let mut total = 0u32;
+/// How many heads across the whole dock currently have a monitor attached (i.e. report
+/// `connector::Status::Connected`), own head included.
+fn connected_head_count() -> u32 {
+    let mut n = 0u32;
     for i in 0..MAX_CARDS {
-        if i != own_slot {
-            total = total.saturating_add(SLOT_PIXEL_RATE[i].load(Ordering::Relaxed));
+        if SLOT_IN_USE[i].load(Ordering::Relaxed) && SLOT_CONNECTED[i].load(Ordering::Relaxed) {
+            n += 1;
         }
     }
-    total
+    n
+}
+
+/// This head's share of the dock's shared pixel-rate `total`, split evenly across however many
+/// heads are currently connected. A lone connected head (or a momentarily-inconsistent count of
+/// zero, e.g. read racing `detect()`) gets the whole budget.
+fn own_pixel_budget(total: u32) -> u32 {
+    let n = connected_head_count().max(1);
+    total / n
 }
 
 /// DDC/CI slave address on the virtual I2C bus (as used by monitor-control tools).
@@ -154,8 +168,8 @@ pub(crate) struct EvdiDrmData {
     /// with `ENODEV` instead of stalling the teardown — e.g. a DDC/CI transfer waiting out its
     /// full timeout would otherwise hold up `i2c_del_adapter` on unbind.
     pub(crate) dying: AtomicBool,
-    /// This device's slot in the module-wide `SLOT_PIXEL_RATE` combined-bandwidth registry,
-    /// claimed once at probe (`claim_pixel_rate_slot`) and released in `shutdown`.
+    /// This device's slot in the module-wide connected-head-count registry, claimed once at
+    /// probe (`claim_pixel_rate_slot`) and released in `shutdown`.
     pub(crate) pixel_rate_slot: usize,
 }
 
@@ -176,12 +190,12 @@ impl EvdiDrmData {
     /// Begin card shutdown: mark the device dying and wake every in-kernel waiter so teardown
     /// (platform unbind → I2C adapter + DRM unregistration) cannot stall behind them. Called
     /// before the rest of the bound data drops; safe to call more than once. Also releases this
-    /// device's combined-bandwidth registry slot so a torn-down card's last mode does not keep
-    /// counting against its siblings' budget forever.
+    /// device's connected-head-count registry slot so a torn-down card does not keep counting
+    /// against its siblings' budget share forever.
     pub(crate) fn shutdown(&self) {
         self.dying.store(true, Ordering::Relaxed);
         self.ddcci_cv.notify_all();
-        SLOT_PIXEL_RATE[self.pixel_rate_slot].store(0, Ordering::Relaxed);
+        SLOT_CONNECTED[self.pixel_rate_slot].store(false, Ordering::Relaxed);
         SLOT_IN_USE[self.pixel_rate_slot].store(false, Ordering::Release);
     }
 
@@ -308,6 +322,15 @@ impl EvdiDrmData {
         let Some(connector) = (unsafe { ptr.as_ref() }) else {
             return;
         };
+        // DLM supplies `pixels_per_second` as a RAW pixel-rate budget (442,368,000 = exactly one
+        // 2560x1440@120) and ignores DisplayLink's on-wire compression, so split evenly it caps two
+        // heads at 1440p@60. macOS runs dual 1440p@120 on this same dock, so the real (compressed)
+        // USB-3 bandwidth has headroom the raw-rate proxy doesn't credit. Apply a compression-headroom
+        // factor of 2 so the combined budget (884,736,000) admits dual 1440p@120 -- everything
+        // downstream (`mode_valid`, `own_pixel_budget`, `atomic_check`) then works off this figure.
+        // (If a dock/content combination cannot actually sustain it, cap the mode in the compositor.)
+        const BANDWIDTH_HEADROOM: u32 = 2;
+        let pixels_per_second = pixels_per_second.saturating_mul(BANDWIDTH_HEADROOM);
         connector
             .pixel_area_limit
             .store(pixel_area, Ordering::Relaxed);
@@ -583,22 +606,25 @@ impl crtc::DriverCrtc for EvdiCrtc {
         })
     }
 
-    /// Reject a commit that, combined with every OTHER device's last-committed mode, would
-    /// exceed the dock's real combined pixel-rate budget. `mode_valid` only ever sees one
+    /// Reject a commit that would raise this head above its even share of the dock's real
+    /// combined pixel-rate budget (`own_pixel_budget` — the whole budget if it's the only
+    /// connected head, half if a sibling is also connected). `mode_valid` only ever sees one
     /// connector at a time and cannot catch two simultaneously-active heads together
     /// overrunning the dock (see the doc comment on `EvdiConnector::mode_valid` and
     /// freeze-20260706-121450), so this is where the full proposed commit's active/mode state
-    /// is known and the combined total can be computed.
+    /// is known and its rate can be checked.
     ///
     /// **Never block a commit that does not increase this device's own rate.** Two earlier
-    /// attempts at this got the "what was I at before" comparison from our own module-static
-    /// registry (`SLOT_PIXEL_RATE`, then a `SLOT_CLAIM_RATE` meant to survive a disable/enable
-    /// pair) and both deadlocked in HW testing -- neither monitor could ever be brought down
-    /// once both were active over budget. Diagnostic logging of the RAW DRM old/new state on
-    /// every call (2026-07-06) showed why: a direct 120Hz->60Hz commit's `take_old_new_state()`
-    /// correctly reports `old` as still active at 120Hz (442368000) at check time -- DRM's own
-    /// old/new state pairing is authoritative and was never the problem; comparing against our
-    /// OWN registry snapshot instead was. Using `old` directly here removes the guesswork.
+    /// attempts at similar checks got the "what was I at before" comparison from our own
+    /// module-static registry (`SLOT_PIXEL_RATE`, then a `SLOT_CLAIM_RATE` meant to survive a
+    /// disable/enable pair) and both deadlocked in HW testing -- neither monitor could ever be
+    /// brought down once both were active over budget. Diagnostic logging of the RAW DRM old/new
+    /// state on every call (2026-07-06) showed why: a direct 120Hz->60Hz commit's
+    /// `take_old_new_state()` correctly reports `old` as still active at 120Hz (442368000) at
+    /// check time -- DRM's own old/new state pairing is authoritative and was never the problem;
+    /// comparing against our OWN registry snapshot instead was. Using `old` directly here removes
+    /// the guesswork, and still applies with the budget itself now split evenly per connected
+    /// head rather than computed from siblings' actual usage.
     fn atomic_check(check: CrtcAtomicCheck<'_, Self>) -> Result {
         let crtc = check.crtc();
         let dev = crtc.drm_dev();
@@ -626,10 +652,10 @@ impl crtc::DriverCrtc for EvdiCrtc {
             // only reduce (or hold) the combined total, so it must always be allowed.
             return Ok(());
         }
-        let total = own_rate.saturating_add(other_heads_rate(data.pixel_rate_slot));
-        if total > budget {
+        let own_budget = own_pixel_budget(budget);
+        if own_rate > own_budget {
             pr_warn!(
-                "evdi: rejecting commit: combined pixel rate {total} exceeds dock budget {budget}\n"
+                "evdi: rejecting commit: pixel rate {own_rate} exceeds this head's budget share ({own_budget} of {budget})\n"
             );
             return Err(EINVAL);
         }
@@ -644,10 +670,6 @@ impl crtc::DriverCrtc for EvdiCrtc {
         let data: &EvdiDrmData = dev;
         let new = commit.take_new_state();
         let mode = new.mode();
-        let rate = u32::from(mode.hdisplay())
-            .saturating_mul(u32::from(mode.vdisplay()))
-            .saturating_mul(mode.vrefresh().max(0) as u32);
-        SLOT_PIXEL_RATE[data.pixel_rate_slot].store(rate, Ordering::Relaxed);
         crate::painter::notify_dpms(data, dev, crate::painter::DPMS_ON);
         crate::painter::notify_mode_changed(
             data,
@@ -666,7 +688,6 @@ impl crtc::DriverCrtc for EvdiCrtc {
         crtc.vblank_off();
         let dev = crtc.drm_dev();
         let data: &EvdiDrmData = dev;
-        SLOT_PIXEL_RATE[data.pixel_rate_slot].store(0, Ordering::Relaxed);
         crate::painter::notify_dpms(data, dev, crate::painter::DPMS_OFF);
     }
 
@@ -795,9 +816,8 @@ impl plane::DriverPlane for EvdiPlane {
             let fb = new.framebuffer::<EvdiDrmDriver>();
             data.set_scanout(fb);
             if fb.is_some() {
-                // TEMP DIAGNOSTIC (2026-07-05): correlate the DLM-CPU-spike-on-panel-toggle
-                // symptom with what the damage iterator actually reports. Logging only, no
-                // behaviour change -- remove once the root cause is confirmed.
+                // Same framebuffer object as the previous commit? Then nothing new was flipped in;
+                // only reported damage clips (in-place draws into the same buffer) carry new content.
                 let fb_unchanged = match old.framebuffer::<EvdiDrmDriver>() {
                     Some(old_fb) => core::ptr::eq(old_fb, fb.unwrap()),
                     None => false,
@@ -809,13 +829,23 @@ impl plane::DriverPlane for EvdiPlane {
                         p.damage.push((r.x1, r.y1, r.x2, r.y2));
                         clip_count += 1;
                     });
-                    p.frame_dirty = true;
+                    // Mark dirty only when there is genuinely new content to grab: a freshly flipped
+                    // framebuffer, or damage on the same buffer. A redundant commit of the same buffer
+                    // with no damage has nothing to transmit.
+                    if !fb_unchanged || clip_count > 0 {
+                        p.frame_dirty = true;
+                    }
                 }
-                pr_info!(
-                    "revdi: atomic_update dev={:#x} fb_unchanged={} clips={}\n",
-                    dev as *const _ as usize,
-                    fb_unchanged,
-                    clip_count
+                // Don't wake DLM to re-grab an IDENTICAL frame (same buffer + zero damage clips) --
+                // that just makes it re-transmit an unchanged screen (the idle-CPU-spike symptom).
+                // Real updates always flip a new buffer or carry damage, so they still propagate; the
+                // damage rects already restrict a real grab to just the changed regions.
+                if fb_unchanged && clip_count == 0 {
+                    return;
+                }
+                pr_debug!(
+                    "revdi: atomic_update dev={:#x} fb_unchanged={fb_unchanged} clips={clip_count}\n",
+                    dev as *const _ as usize
                 );
                 crate::painter::notify_update_ready(data, dev);
             }
@@ -960,8 +990,14 @@ impl connector::DriverConnector for EvdiConnector {
     /// compositor configure the output at the wrong resolution and then reconfigure/disable it when
     /// the EDID (and native modes) show up -- which manifested as the dock output freezing on its
     /// first frame. This mirrors the C evdi's disconnected-until-EDID hotplug sequencing.
+    ///
+    /// Also records this head's connection state in the module-wide registry, so
+    /// `own_pixel_budget` knows how many heads are currently sharing the dock's budget.
     fn detect(connector: &connector::Connector<Self>, _force: bool) -> connector::Status {
-        if connector.cached_edid.lock().is_some() {
+        let data: &EvdiDrmData = connector.drm_dev();
+        let connected = connector.cached_edid.lock().is_some();
+        SLOT_CONNECTED[data.pixel_rate_slot].store(connected, Ordering::Relaxed);
+        if connected {
             connector::Status::Connected
         } else {
             connector::Status::Disconnected
@@ -971,19 +1007,18 @@ impl connector::DriverConnector for EvdiConnector {
     /// Reject modes the dock cannot move, using the `pixel_area_limit` / `pixel_per_second_limit`
     /// the DLM client supplied through CONNECT -- a port of the C evdi's `evdi_mode_valid`, with
     /// one addition: the pixel-rate budget checked here is not the connector's raw
-    /// `pixel_per_second_limit` but that shared total *minus* every other head's currently
-    /// committed rate (`other_heads_rate`), so e.g. once one head is running 2560x1440@120, the
-    /// other head's advertised list simply stops containing modes that wouldn't fit alongside
-    /// it -- the compositor's own mode-preference logic then naturally settles on the best mode
-    /// that IS still offered (e.g. @60) instead of ever proposing @120 and getting the commit
-    /// rejected. Like C, the lowest-refresh mode of each resolution is kept even when it exceeds
-    /// the remaining budget (the device then runs it at a limited frame rate rather than losing
-    /// the resolution entirely).
+    /// `pixel_per_second_limit` but this head's even share of it (`own_pixel_budget`), so e.g.
+    /// with two heads connected, each only ever advertises modes fitting in half the dock's
+    /// budget -- the compositor's own mode-preference logic then naturally settles on the best
+    /// mode that IS still offered (e.g. @60) instead of ever proposing something that only fits
+    /// while a sibling is idle. Like C, the lowest-refresh mode of each resolution is kept even
+    /// when it exceeds the remaining budget (the device then runs it at a limited frame rate
+    /// rather than losing the resolution entirely).
     ///
     /// Caveat: this list is only recomputed when DRM reprobes the connector (hotplug / explicit
-    /// re-detect), not live at every atomic commit -- if both heads change mode in the same
-    /// instant with no reprobe in between, the mode list a head advertised before the sibling's
-    /// change can still be stale. `EvdiCrtc::atomic_check` is the hard backstop for that case
+    /// re-detect), not live at every atomic commit -- if a sibling connects or disconnects with no
+    /// reprobe of this connector in between, the mode list advertised here can be stale relative
+    /// to the current head count. `EvdiCrtc::atomic_check` is the hard backstop for that case
     /// (see freeze-20260706-121450) and always sees the truth at commit time; this check exists
     /// so the common case (heads coming up at different times, or one head's config changing
     /// while the other is already active) is handled by advertising the right modes up front
@@ -996,7 +1031,7 @@ impl connector::DriverConnector for EvdiConnector {
         let area = u32::from(mode.hdisplay()) * u32::from(mode.vdisplay());
         let vrefresh = mode.vrefresh().max(0) as u32;
         if area > connector.pixel_area_limit.load(Ordering::Relaxed) {
-            pr_warn!(
+            pr_debug!(
                 "evdi: mode {}x{}@{} rejected: mode area too big\n",
                 mode.hdisplay(),
                 mode.vdisplay(),
@@ -1004,22 +1039,21 @@ impl connector::DriverConnector for EvdiConnector {
             );
             return ModeStatus::Bad;
         }
-        let data: &EvdiDrmData = connector.drm_dev();
-        let budget_left = pps.saturating_sub(other_heads_rate(data.pixel_rate_slot));
+        let budget_left = own_pixel_budget(pps);
         if area.saturating_mul(vrefresh) <= budget_left {
             return ModeStatus::Ok;
         }
         if is_lowest_frequency_mode_of_resolution(connector, mode) {
-            pr_warn!(
-                "evdi: mode {}x{}@{} exceeds the remaining dock budget ({budget_left} of {pps} left), output frame rate may be limited\n",
+            pr_debug!(
+                "evdi: mode {}x{}@{} exceeds this head's dock budget share ({budget_left} of {pps}), output frame rate may be limited\n",
                 mode.hdisplay(),
                 mode.vdisplay(),
                 vrefresh
             );
             return ModeStatus::Ok;
         }
-        pr_warn!(
-            "evdi: mode {}x{}@{} rejected: exceeds remaining dock budget ({budget_left} of {pps} left)\n",
+        pr_debug!(
+            "evdi: mode {}x{}@{} rejected: exceeds this head's dock budget share ({budget_left} of {pps})\n",
             mode.hdisplay(),
             mode.vdisplay(),
             vrefresh
