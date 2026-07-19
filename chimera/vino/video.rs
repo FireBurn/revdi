@@ -1194,6 +1194,52 @@ pub(crate) mod wht {
         Ok((frame_records(&strips)?, seq0))
     }
 
+    /// Damage-aware variant of [`colour_frame_ep08`]: encodes **only** the 64x16 strips that
+    /// intersect a client damage rectangle, producing a *partial* frame (the dock updates the tiles
+    /// it receives at their self-encoded positions and keeps the rest -- how DLM does partial
+    /// updates; see `docs/VIDEO-PARTIAL-UPDATE-DESIGN.md`). A typical desktop change (caret, cursor,
+    /// small window) touches a handful of strips, so this is KB not MB.
+    ///
+    /// `clips` are `(x0, y0, x1, y1)` half-open rectangles in output/source pixels (identity
+    /// rotation only -- the caller sends a full [`colour_frame_ep08`] otherwise). A strip at
+    /// `(sx, sy)` is included iff some clip overlaps `[sx, sx+STRIP_W) x [sy, sy+STRIP_H)`. Raster
+    /// iteration keeps strips x-ordered within each y-band, so [`frame_records`] groups them exactly
+    /// as the full-frame path does. Returns an **empty** frame list when no strip is touched -- the
+    /// caller must skip the USB write in that case (no-op flip). **The first frame after a mode-set
+    /// must still be a full keyframe** (the dock's framebuffer is undefined until then).
+    ///
+    /// `#[inline(never)]`: same kernel-stack-overflow guard as [`colour_frame_ep08`].
+    #[inline(never)]
+    pub(crate) fn colour_frame_ep08_damage(
+        width: usize,
+        height: usize,
+        seq0: u32,
+        clips: &[(usize, usize, usize, usize)],
+        mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
+    ) -> Result<(KVec<KVec<u8>>, u32)> {
+        if width % STRIP_W != 0 || height % STRIP_H != 0 {
+            return Err(kernel::error::code::EINVAL);
+        }
+        let mut strips: KVec<KVec<u8>> = KVec::new();
+        let mut sy = 0usize;
+        while sy < height {
+            let mut sx = 0usize;
+            while sx < width {
+                // Include this strip iff any damage clip overlaps its 64x16 tile.
+                let hit = clips.iter().any(|&(x0, y0, x1, y1)| {
+                    sx < x1 && x0 < sx + STRIP_W && sy < y1 && y0 < sy + STRIP_H
+                });
+                if hit {
+                    let blocks = colour_strip_blocks(sx, sy, &mut px)?;
+                    strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
+                }
+                sx += STRIP_W;
+            }
+            sy += STRIP_H;
+        }
+        Ok((frame_records(&strips)?, seq0))
+    }
+
     /// A strip's `y` (the EP08 record bands group strips by row). Reads the `y` field the strip
     /// builders write at byte offset 4 ([`colour_strip`] / [`solid_strip`]).
     fn strip_y(s: &[u8]) -> u16 {

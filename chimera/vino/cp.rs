@@ -832,68 +832,75 @@ pub(super) fn aux_for_id(id: u16, body_len: usize) -> u16 {
 /// (`captures/rr-out-sequence-20260716/cp-dialogue-decoded.txt`, ictr 14..22 for head 0 / 23..31
 /// for head 1).
 ///
-/// **2026-07-17: lengths corrected (2nd attempt, this time WITH real content -- see below).**
-/// The first attempt at these lengths (content_len +16 across the board, cross-validated against
-/// `captures/live-3426-20260707/reauth.pcap`) HW-tested as a disconnect regression when combined
-/// with random-filler content + bare head-index markers (`project_per_head_burst_length_
-/// regression_20260717`) and was reverted. Re-examining the "real region" each corrected length
-/// opens up (past the header/pad/marker) against known AKE material sizes found a much stronger
-/// hypothesis than markers alone: **`id=0x9a`'s ~136-byte real region fits `Ekpub(km)` (128B)
-/// almost exactly, and `id=0x22`'s second occurrence's 24-byte real region fits `edkey`+`riv_ske`
-/// (16+8=24B) EXACTLY** -- i.e. these are not random-content messages with an incidentally-wrong
-/// length, they are genuine restatements of the real values `VinoDriver::run_ake` already
-/// computed (`Session::ake`, now retained instead of discarded) and the old random filler was
-/// very possibly the actual fault trigger, not the length change itself. `id=0x22`'s first
-/// occurrence (rtx, 8B known against a 24B region) and `id=0x2a` (rn, 8B against 24B) are lower
-/// confidence -- real value placed first, remainder still best-effort random. `id=0x1f` (cert,
-/// 24B region against a 522B real cert) has no plausible direct fit and stays random. `id=0x26`
-/// is fully decoded separately by [`stream_manage_restatement`]. See
-/// `VinoDriver::send_cp_setup`'s per-head loop for how each entry's content is actually built.
+/// **2026-07-17: framing FULLY resolved by decryption (`docs/CP-PERHEAD-RESTATEMENT.md`).**
+/// Earlier attempts read only the 24-byte truncation in `cp-dialogue-decoded.txt` and guessed at
+/// the layout (placing real AKE values at off24 with no HDCP msg-id, `Session::ake` restatement),
+/// which HW-tested as a disconnect regression (`project_per_head_burst_length_regression_20260717`)
+/// and is now known to be the leading suspect for the head-1 NAK -> dock-reset loop. Decrypting
+/// the *complete* encrypted burst (trace1, via `scripts/decrypt-perhead-restatement.py`) shows
+/// each restatement is byte-for-byte the plaintext AKE body (`ake::body`: HDCP msg-id at off27,
+/// payload at off28) with the `0x30`@22 marker swapped for `off22=0, off23=head+1`. The lengths
+/// here are correct (measured from raw ciphertext block counts -- `id=0x9a` is 160B, i.e. 10 AES
+/// blocks, matching the seq gap 16->26). **The payloads are DERIVED standard-HDCP-2.2 crypto, not
+/// random** (rr-confirmed 2026-07-17: the restatement `Ekpub` is a real RSA-1024 output, `V` a
+/// RepeaterAuth_Send_Ack). This is a per-head **downstream repeater AKE**: `VinoDriver::send_cp_setup`
+/// computes a fresh self-consistent chain per head (`Ekpub(km_h)`, `edkey`, `V=HMAC(kd_h,list)`)
+/// from the same proven primitives `run_ake` uses. The CP-encrypted framing and a few non-standard
+/// trailing bytes past each HDCP field are DisplayLink-proprietary (left best-effort/zero, RE
+/// pending). `id=0x26` is built by [`stream_manage_restatement`]. See that loop for the exact bytes.
 ///
 /// [`VinoDriver::send_cp_setup`]: super::VinoDriver::send_cp_setup
 pub(super) const CP_SETUP_PER_HEAD: [(u16, u16, usize); 9] = [
-    (0x0022, 0x0010, 48),  // AKE_Init (rtx) restatement -- rtx known, rest best-effort
-    (0x001f, 0x0010, 48),  // AKE_Send_Cert restatement -- no plausible fit, random
-    (0x009a, 0x0010, 160), // AKE_No_Stored_km -- REAL Ekpub(km), 128B, high confidence
-    (0x0022, 0x0010, 48),  // SKE_Send_Eks -- REAL edkey+riv_ske, 24B exact fit, high confidence
-    (0x0032, 0x0010, 64),  // per-head VIDEO KEY (content[8..40]; no room for a marker byte)
-    (0x002a, 0x0010, 48),  // LC_Init (rn) restatement -- rn known, rest best-effort
-    (0x0026, 0x0010, 48),  // RepeaterAuth V / Stream_Manage -- built by stream_manage_restatement
-    (0x0014, 0x0030, 32),  // per-head stream-open ctl (dock replies id=0x78 DISPLAY-CAP) -- fully random
-    (0x0019, 0x0031, 32),  // per-head strm2 -- head marker @ content[22]
+    (0x0022, 0x0010, 48),  // AKE_Init -- msg-id 0x02 @off27, 20B random payload
+    (0x001f, 0x0010, 48),  // AKE_Transmitter_Info -- msg-id 0x13, fixed 00 06 02 00 02 prefix
+    (0x009a, 0x0010, 160), // AKE_No_Stored_km -- msg-id 0x04, 132B payload (10 AES blocks)
+    (0x0022, 0x0010, 48),  // LC_Init -- msg-id 0x09 @off27, 20B random payload
+    (0x0032, 0x0010, 64),  // per-head VIDEO KEY -- msg-id 0x0b, fresh 32B key @off28, stashed
+    (0x002a, 0x0010, 48),  // LC_Send_L_prime -- msg-id 0x0f @off27, 20B random payload
+    (0x0026, 0x0010, 48),  // RepeaterAuth Stream_Manage -- built by stream_manage_restatement
+    (0x0014, 0x0030, 32),  // per-head stream-open ctl -- no marker/tag, 10B random @off22
+    (0x0019, 0x0031, 32),  // per-head strm2 -- head @off22, fixed 06 [head*4] 04 @off24
 ];
-/// Build the fully-decoded `id=0x0026 sub=0x0010` (RepeaterAuth_Send_Ack / Stream_Manage
-/// restatement) content for one head: 48 bytes total. **Fully reverse-engineered 2026-07-17**
-/// from two independent real sessions (`cp-dialogue-decoded.txt` ictr 20/29 and
-/// `captures/live-3426-20260707/reauth.pcap` ictr 20/29) -- every byte except the trailing
-/// 8-byte tail matched exactly across BOTH sessions (different dates, different keys), so this
-/// is not session-random, it's the deterministic protocol layout:
-/// `[8B header][12 zero][head:u32 LE = 1 or 2][0x10:u32 LE][0:u32 LE][1:u32 LE]
-/// [seq:u32 LE = 8 for head 0 / 9 for head 1][8B host-random tail]`. The `seq` field's meaning
-/// past "8 then 9" is not understood -- hardcoded to match both captures exactly rather than
-/// guessed at.
+/// Build the `id=0x0026 sub=0x0010` (RepeaterAuth Stream_Manage restatement) content for one
+/// head: 48 bytes. **Framing corrected 2026-07-17** against a FULL AES-CTR decryption of the real
+/// burst (`docs/CP-PERHEAD-RESTATEMENT.md`) -- the earlier reconstruction, from the 24-byte
+/// truncation in `cp-dialogue-decoded.txt`, wrongly placed the head marker as a u32 at off20 and
+/// `0x10` at off24. The real deterministic layout (everything but the 8-byte random tail is
+/// head-invariant across sessions): `[8B header][14 zero][head+1 @off23][0 @off24..27]
+/// [0x10 msg-id @off27][0 @off28..32][1:u32 @off32][seq:u32 = 8/9 @off36][8B host-random tail]`.
+/// The `seq` field's meaning past "8 then 9" is not understood -- hardcoded to match the wire.
 pub(super) fn stream_manage_restatement(counter: u16, head: u8) -> Result<KVec<u8>> {
-    let mut b = KVec::with_capacity(48, GFP_KERNEL)?;
-    header(&mut b, 0x26, 0x10, counter)?;
-    pad_to(&mut b, 20)?;
-    b.extend_from_slice(&(head as u32 + 1).to_le_bytes(), GFP_KERNEL)?; // off20: head marker
-    b.extend_from_slice(&0x10u32.to_le_bytes(), GFP_KERNEL)?; // off24
-    b.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?; // off28
-    b.extend_from_slice(&1u32.to_le_bytes(), GFP_KERNEL)?; // off32
-    b.extend_from_slice(&(head as u32 + 8).to_le_bytes(), GFP_KERNEL)?; // off36: seq (8/9)
+    // Layout ground-truthed 2026-07-17 by FULL AES-CTR decryption of trace1's encrypted per-head
+    // burst (`docs/CP-PERHEAD-RESTATEMENT.md`, `scripts/decrypt-perhead-restatement.py`),
+    // superseding the earlier truncated-decode guess that placed the head marker at off20 and the
+    // 0x10 tag at off24. The real wire, like every other restatement entry, carries the head
+    // marker at off23 and the HDCP msg-id (0x10) at off27, then the `0 / 1 / (head+8)` u32 fields
+    // and an 8-byte host-random tail the dock does not validate.
+    let mut b = KVec::from_elem(0u8, 48, GFP_KERNEL)?;
+    b[0..2].copy_from_slice(&0x0026u16.to_le_bytes());
+    b[2..4].copy_from_slice(&0x0010u16.to_le_bytes());
+    b[4..6].copy_from_slice(&counter.to_le_bytes());
+    b[23] = head + 1; // head marker
+    b[27] = 0x10; // HDCP msg-id (RepeaterAuth_Stream_Manage)
+    b[32..36].copy_from_slice(&1u32.to_le_bytes());
+    b[36..40].copy_from_slice(&(head as u32 + 8).to_le_bytes()); // seq: 8 head0 / 9 head1
     let mut tail = [0u8; 8];
     rng::fill(&mut tail);
-    b.extend_from_slice(&tail, GFP_KERNEL)?; // off40..48
+    b[40..48].copy_from_slice(&tail);
     Ok(b)
 }
-/// Stream-finalize tail sent once, after both heads' [`CP_SETUP_PER_HEAD`] blocks: `(id, sub)`,
-/// each with a fixed 16-byte content. Decoded from the same capture (ictr 32..36).
-pub(super) const CP_SETUP_FINALIZE: [(u16, u16); 5] = [
-    (0x0016, 0x004c),
-    (0x0015, 0x004a),
-    (0x0016, 0x004c),
-    (0x0016, 0x004c),
-    (0x0015, 0x004a),
+/// Stream-finalize tail sent once, after both heads' [`CP_SETUP_PER_HEAD`] blocks: `(id, sub,
+/// off22)`. **2026-07-17: corrected against the full decryption** (`docs/CP-PERHEAD-RESTATEMENT.md`,
+/// ictr 32..36) -- the content is **32 bytes** (the old 16 was half the real length), with
+/// `[8..22]` zero, a per-message index flag at off22 (the observed `0/0/0/1/1` sequence), and for
+/// the `sub=0x4c` messages a constant `0x01` at off23; the rest of the tail is host-random (varies
+/// per message, dock does not validate it).
+pub(super) const CP_SETUP_FINALIZE: [(u16, u16, u8); 5] = [
+    (0x0016, 0x004c, 0),
+    (0x0015, 0x004a, 0),
+    (0x0016, 0x004c, 0),
+    (0x0016, 0x004c, 1),
+    (0x0015, 0x004a, 1),
 ];
 
 /// Structured burst DLM sends directly on each head's **video** bulk-OUT endpoint (EP08 head 0 /
@@ -965,17 +972,35 @@ pub(super) const CP_SETUP_FINALIZE: [(u16, u16); 5] = [
 /// content (2/3's 16 B and 8/9's 1104 B) is host-random filler, not proven -- see
 /// `project_video_endpoint_arm_burst_found_20260716` for the original derivation and treat any HW
 /// test of this as "does the dock's reaction change at all", not "this is known correct".
+/// **The COLD arm burst** — DLM's real first-video bring-up, 4-way confirmed across the cold-plug
+/// pcaps (`dlm-cold-3426-20260714…` frame 1818, `…20260713-225656` frame 1603, +2), re-verified
+/// 2026-07-19. See `docs/EP08-ARM-BURST.md`. This is what vino needs: it brings up video on a fresh
+/// CP session, so the pipe is unarmed for it. (An earlier 2026-07-18 rr trace captured a *warm
+/// re-arm* — 352 B, lighter #6-9 — which is a DIFFERENT, insufficient burst; live HW confirmed the
+/// dock accepts it but then ESHUTDOWNs the video frame.)
+///
+/// **Delivery:** the whole 2560-byte burst is **PREPENDED to frame 0's video in ONE URB** (records
+/// #0-9 = arm, #10+ = video), NOT a separate transfer. Layout `(wire_type, sub_base, aux,
+/// content_len)`; actual `sub = sub_base + head`.
+/// - #0/#1/#4/#5: `type=2` plaintext (byte-known bodies).
+/// - #6/#7: `type=4` but FIXED plaintext `0a 00 04 00 …00 10 00 00 00 00` (no seal), sub 0x00/0x10.
+/// - #2/#3/#8/#9: `type=4` SEALED under this head's VIDEO channel key (`ske_ks_h XOR CP_KEY_WHITEN`)
+///   + content nonce (`riv_h ^0x04@byte7`), sharing ONE block counter (seq 0,1,2,71). #2/#3 = 16 B
+///   plaintext (`04 00 08 04 03 00` + 10 host-random). **#8/#9 = 1104 B plaintext each = the
+///   per-frame video-decode setup, still UNKNOWN (encrypted; needs a cold-plug keyed capture +
+///   XOR-loop decrypt).** The seal KEY/framing are known + HW-validated (#2/#3 accepted); only the
+///   1104 B content is missing — that is the sole remaining video blocker.
 pub(super) const VIDEO_ARM_BURST: [(u32, u16, u16, usize); 10] = [
-    (2, 0x0008, 0x0000, 16),
-    (2, 0x0018, 0x0000, 16),
-    (4, 0x0008, 0x000a, 16),
-    (4, 0x0018, 0x000a, 16),
-    (2, 0x0000, 0x0000, 16),
-    (2, 0x0010, 0x0000, 16),
-    (4, 0x0000, 0x0004, 0),
-    (4, 0x0010, 0x0004, 0),
-    (4, 0x0008, 0x000e, 1104),
-    (4, 0x0018, 0x000e, 1104),
+    (2, 0x0008, 0x0000, 16),   // #0 plaintext: body 08 00 06
+    (2, 0x0018, 0x0000, 16),   // #1 plaintext: body 08 00 16
+    (4, 0x0008, 0x000a, 16),   // #2 SEALED 16B, per-head video key, seq 0
+    (4, 0x0018, 0x000a, 16),   // #3 SEALED 16B, per-head video key, seq 1
+    (2, 0x0000, 0x0000, 16),   // #4 plaintext: body 00
+    (2, 0x0010, 0x0000, 16),   // #5 plaintext: body 00 00 10
+    (4, 0x0000, 0x0004, 16),   // #6 type=4 FIXED plaintext 0a 00 04 … (sub 0x00, unsealed)
+    (4, 0x0010, 0x0004, 16),   // #7 type=4 FIXED plaintext 0a 00 04 … (sub 0x10, unsealed)
+    (4, 0x0008, 0x000e, 1104), // #8 SEALED 1104B, per-head video key, seq 2 — content UNKNOWN
+    (4, 0x0018, 0x000e, 1104), // #9 SEALED 1104B, per-head video key, seq 71 — content UNKNOWN
 ];
 
 /// Build the fully-known 16-byte plaintext body for one of [`VIDEO_ARM_BURST`]'s `wire_type==2`
@@ -999,8 +1024,8 @@ pub(super) fn video_arm_plaintext_body(i: usize, h: u16) -> [u8; 16] {
             b[0..2].copy_from_slice(&h.to_le_bytes());
             b[2..4].copy_from_slice(&0x0010u16.to_le_bytes());
         }
-        // Indices 6/7 are no longer plaintext (see VIDEO_ARM_BURST's doc comment -- they're
-        // sealed, empty-content Dl3Cmac-only messages), so this function is never called for them.
+        // In the COLD arm #6/#7 are NOT type-2 plaintext — they are type-4 fixed `0a 00 04 …`
+        // records built directly in `build_arm_burst_buf`, so this fn is never called for them.
         _ => {}
     }
     b
