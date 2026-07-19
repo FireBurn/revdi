@@ -415,6 +415,12 @@ impl drm::Driver for EvdiDrmDriver {
 
     const INFO: drm::DriverInfo = INFO;
 
+    // Register the cursor hotspot properties so the compositor's `hotspot_x/y` reach the plane
+    // state -- `EvdiCrtc`'s cursor path already reads and forwards them to the DLM client (which
+    // composites the cursor on the real monitor). Matches C evdi 1.15, which registers them; the
+    // forwarding code was live but dormant until this opt-in existed in the Rust binding.
+    const FEAT_CURSOR_HOTSPOT: bool = true;
+
     kernel::declare_drm_ioctls_ext! {
         (EVDI_CONNECT, crate::uapi::DrmEvdiConnect,
             crate::uapi::DRM_IOCTL_EVDI_CONNECT, 0, crate::ioctl::connect),
